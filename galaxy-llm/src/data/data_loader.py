@@ -132,14 +132,26 @@ class SchoolQADataset(Dataset):
             "history": self.dialogue_history.history.copy()
         }
 
+def collate_fn(batch):
+    """自定义的collate函数，确保批次中的样本大小一致"""
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
+
 class SchoolQADataLoader:
     """学校问答数据加载器"""
     def __init__(
         self,
         data_dir: str,
         tokenizer: PreTrainedTokenizer,
-        batch_size: int = 8,  # 减小批次大小以适应长文本
-        max_length: int = 2048,  # 增加最大长度
+        batch_size: int = 8,
+        max_length: int = 2048,
         with_chain_of_thought: bool = True,
         max_turns: int = 10,
         num_workers: int = 4
@@ -158,8 +170,10 @@ class SchoolQADataLoader:
         shuffle: bool = True
     ) -> DataLoader:
         """创建数据加载器"""
+        data_path = self.data_dir / "processed" / "split" / f"{split}.json"
+            
         dataset = SchoolQADataset(
-            data_path=self.data_dir / f"{split}.json",
+            data_path=data_path,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
             with_chain_of_thought=self.with_chain_of_thought,
@@ -171,7 +185,8 @@ class SchoolQADataLoader:
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn  # 添加自定义的collate_fn
         )
         
     def get_train_dataloader(self) -> DataLoader:

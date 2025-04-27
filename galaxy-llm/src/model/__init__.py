@@ -1,3 +1,6 @@
+"""
+Model package initialization
+"""
 from .transformer import Transformer
 from .expert import (
     Expert,
@@ -8,7 +11,7 @@ from .expert import (
     LogicExpert,
     CommonSenseExpert
 )
-from .router import Router, DynamicRouter, LoadBalancer
+from .router import GPRORouter, DynamicRouter, LoadBalancer
 from .model import GalaxyLLM
 
 __all__ = [
@@ -20,7 +23,7 @@ __all__ = [
     'MathExpert',
     'LogicExpert',
     'CommonSenseExpert',
-    'Router',
+    'GPRORouter',
     'DynamicRouter',
     'LoadBalancer',
     'GalaxyLLM'

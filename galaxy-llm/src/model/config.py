@@ -4,6 +4,10 @@ from typing import Dict, List, Optional
 @dataclass
 class ExpertConfig:
     """专家模型配置"""
+    name: str = "default"  # 专家名称
+    domain: str = "general"  # 专家领域
+    tasks: List[str] = None  # 专家任务列表
+    trainable: bool = True  # 是否可训练
     vocab_size: int = 50000  # 词表大小
     hidden_size: int = 768  # 隐藏层维度
     num_layers: int = 12  # Transformer层数
@@ -18,6 +22,10 @@ class ExpertConfig:
     eos_token_id: int = 2
     use_cache: bool = True
     gradient_checkpointing: bool = True  # 启用梯度检查点以节省显存
+
+    def __post_init__(self):
+        if self.tasks is None:
+            self.tasks = []
 
 @dataclass
 class MoEConfig:
@@ -110,6 +118,8 @@ class ModelConfig:
     gradient_accumulation_steps: int = 4  # 梯度累积步数
     max_grad_norm: float = 1.0  # 最大梯度范数
     batch_size: int = 8  # 批次大小
+    fp16: bool = False  # 是否使用 FP16
+    eos_token_id: int = 102  # 结束标记 ID
 
 # 教育领域专家配置
 EDUCATION_EXPERTS = [

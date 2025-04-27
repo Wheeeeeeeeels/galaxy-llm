@@ -1,28 +1,9 @@
 import os
-import json
 import logging
 import torch
-import argparse
-from typing import Dict, Any, List
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer
-)
-from tqdm import tqdm
-
-from .config.model_config import MODEL_CONFIG, DATA_CONFIG
-from .data.dataset import create_test_dataset
-from .utils.metrics import compute_metrics
-from .utils.logger import (
-    setup_logger,
-    log_metrics,
-    log_config,
-    log_memory_usage
-)
+from transformers import PreTrainedTokenizerFast
 from model.moe_model import MoEModel
 from model.config import COT_MODEL_CONFIG, DIRECT_MODEL_CONFIG
-from model.tokenizer import ChineseTokenizer
 
 # 配置日志
 logging.basicConfig(
@@ -31,269 +12,137 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def parse_args() -> argparse.Namespace:
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser()
-    
-    # 模型参数
-    parser.add_argument(
-        '--model_name',
-        type=str,
-        default='bert-base-chinese',
-        help='模型名称'
-    )
-    parser.add_argument(
-        '--model_path',
-        type=str,
-        required=True,
-        help='模型路径'
-    )
-    parser.add_argument(
-        '--max_seq_length',
-        type=int,
-        default=512,
-        help='最大序列长度'
-    )
-    
-    # 数据参数
-    parser.add_argument(
-        '--test_file',
-        type=str,
-        required=True,
-        help='测试文件路径'
-    )
-    parser.add_argument(
-        '--max_test_samples',
-        type=int,
-        default=None,
-        help='最大测试样本数'
-    )
-    
-    # 其他参数
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='outputs',
-        help='输出目录'
-    )
-    parser.add_argument(
-        '--log_file',
-        type=str,
-        default=None,
-        help='日志文件路径'
-    )
-    parser.add_argument(
-        '--use_cot',
-        action='store_true',
-        help='是否使用思维链'
-    )
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda' if torch.cuda.is_available() else 'cpu',
-        help='设备'
-    )
-    
-    return parser.parse_args()
-
-def inference(
-    model: AutoModelForCausalLM,
-    test_loader: DataLoader,
-    args: argparse.Namespace,
-    logger: Any
-) -> Dict[str, float]:
-    """
-    推理模型
-    
-    Args:
-        model: 模型
-        test_loader: 测试数据加载器
-        args: 参数
-        logger: 日志记录器
-        
-    Returns:
-        评估指标
-    """
-    model.eval()
-    predictions = []
-    labels = []
-    
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Inferencing"):
-            # 将数据移到设备
-            batch = {k: v.to(args.device) for k, v in batch.items()}
-            
-            # 前向传播
-            outputs = model(**batch)
-            
-            # 获取预测结果
-            preds = torch.argmax(outputs.logits, dim=-1)
-            predictions.extend(preds.cpu().numpy().tolist())
-            labels.extend(batch['labels'].cpu().numpy().tolist())
-            
-    # 计算指标
-    metrics = compute_metrics(
-        predictions=predictions,
-        labels=labels,
-        metrics=['accuracy', 'f1']
-    )
-    
-    return metrics
-
-def save_predictions(
-    predictions: List[int],
-    output_dir: str
-):
-    """
-    保存预测结果
-    
-    Args:
-        predictions: 预测结果
-        output_dir: 输出目录
-    """
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 保存预测结果
-    with open(os.path.join(output_dir, 'predictions.txt'), 'w') as f:
-        for pred in predictions:
-            f.write(f"{pred}\n")
+# 获取项目根目录
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class ModelInference:
     """模型推理"""
     def __init__(
         self,
-        model_type: str = "cot",
+        model_type: str = "cot",  # "cot" 或 "direct"
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.device = torch.device(device)
         self.model_type = model_type
         
-        # 初始化分词器
-        self.tokenizer = ChineseTokenizer()
-        
-        # 加载模型
+        # 加载模型和分词器
         self.model = self._load_model()
+        self.tokenizer = self._load_tokenizer()
         
     def _load_model(self) -> MoEModel:
         """加载模型"""
         if self.model_type == "cot":
+            # 思维链模型（MoE + 强化学习，类似DeepSeek-R1）
             model = MoEModel(COT_MODEL_CONFIG).to(self.device)
-            model.load_state_dict(torch.load("checkpoints/cot_model/best_model_cot.pt"))
+            model_path = os.path.join(ROOT_DIR, "checkpoints", "best_model.pt")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
         else:
+            # 直接回答模型（MoE + 传统训练，类似DeepSeek-V3）
             model = MoEModel(DIRECT_MODEL_CONFIG).to(self.device)
-            model.load_state_dict(torch.load("checkpoints/direct_model/best_model_direct.pt"))
+            model_path = os.path.join(ROOT_DIR, "checkpoints", "best_model.pt")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
             
         model.eval()
         return model
     
+    def _load_tokenizer(self) -> PreTrainedTokenizerFast:
+        """加载分词器"""
+        tokenizer_path = os.path.join(ROOT_DIR, "tokenizer", "tokenizer.json")
+        return PreTrainedTokenizerFast(
+            tokenizer_file=tokenizer_path,
+            bos_token="[BOS]",
+            eos_token="[EOS]",
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]"
+        )
+    
     def generate(
         self,
-        instruction: str,
-        input_text: str = "",
-        max_length: int = 2048,
+        prompt: str,
+        max_length: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
         num_return_sequences: int = 1
-    ) -> List[str]:
-        """生成回答"""
-        # 构建输入文本
-        prompt = f"指令：{instruction}\n输入：{input_text}"
+    ) -> str:
+        """生成回答
         
+        Args:
+            prompt: 输入提示
+            max_length: 最大生成长度
+            temperature: 采样温度
+            top_p: 核采样概率
+            num_return_sequences: 返回序列数量
+            
+        Returns:
+            生成的回答
+        """
         # 编码输入
-        encoded = self.tokenizer.encode(prompt)
-        input_ids = encoded["input_ids"].unsqueeze(0).to(self.device)
-        attention_mask = encoded["attention_mask"].unsqueeze(0).to(self.device)
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length
+        )
         
-        # 生成
+        # 将输入移到设备
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # 生成回答
         with torch.no_grad():
             outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                num_return_sequences=num_return_sequences,
-                temperature=temperature
-            )
-            
-        # 解码输出
-        generated_texts = self.tokenizer.batch_decode(outputs.tolist())
-        
-        return generated_texts
-    
-    def batch_generate(
-        self,
-        instructions: List[str],
-        input_texts: List[str] = None,
-        max_length: int = 2048,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        num_return_sequences: int = 1
-    ) -> List[List[str]]:
-        """批量生成回答"""
-        if input_texts is None:
-            input_texts = [""] * len(instructions)
-            
-        all_generated_texts = []
-        for instruction, input_text in zip(instructions, input_texts):
-            generated_texts = self.generate(
-                instruction=instruction,
-                input_text=input_text,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 max_length=max_length,
                 temperature=temperature,
-                top_p=top_p,
                 num_return_sequences=num_return_sequences
             )
-            all_generated_texts.append(generated_texts)
-            
-        return all_generated_texts
+        
+        # 解码输出
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return response
 
 def main():
-    # 创建推理实例
-    cot_inference = ModelInference(model_type="cot")
-    direct_inference = ModelInference(model_type="direct")
-    
-    # 测试样例
+    # 测试用例
     test_cases = [
-        {
-            "instruction": "请介绍香港的教育体系",
-            "input": ""
-        },
-        {
-            "instruction": "比较香港和内地的高考制度",
-            "input": ""
-        },
-        {
-            "instruction": "推荐几所香港的大学",
-            "input": ""
-        }
+        "香港的力行幼稚园的学校规模是否存在？",
+        "请问香港的力行幼稚园的学校生活是什么？",
+        "香港的力行幼稚园的校长是谁？",
+        "香港的力行幼稚园的校监是谁？",
+        "香港的力行幼稚园的教育宗旨是什么？",
+        "香港的力行幼稚园的教学措施或班级结构是什么？",
+        "香港的力行幼稚园的入学条件是什么？",
+        "香港的力行幼稚园的组织属性英文类别是什么？",
+        "香港的力行幼稚园的电子邮件是什么？",
+        "香港的力行幼稚园的学校名称是什么？"
     ]
     
-    # 生成回答
-    logger.info("使用思维链模型生成回答...")
-    cot_answers = cot_inference.batch_generate(
-        instructions=[case["instruction"] for case in test_cases],
-        input_texts=[case["input"] for case in test_cases]
-    )
+    # 测试思维链模型
+    logger.info("测试思维链模型（MoE + 强化学习，类似DeepSeek-R1）...")
+    cot_inference = ModelInference(model_type="cot")
+    for prompt in test_cases:
+        response = cot_inference.generate(prompt)
+        print(f"\n问题: {prompt}")
+        print(f"思维链模型回答: {response}")
     
-    logger.info("使用直接回答模型生成回答...")
-    direct_answers = direct_inference.batch_generate(
-        instructions=[case["instruction"] for case in test_cases],
-        input_texts=[case["input"] for case in test_cases]
-    )
-    
-    # 保存结果
-    results = []
-    for i, case in enumerate(test_cases):
-        results.append({
-            "instruction": case["instruction"],
-            "input": case["input"],
-            "cot_answer": cot_answers[i][0],
-            "direct_answer": direct_answers[i][0]
-        })
-        
-    with open("inference_results.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    logger.info("推理结果已保存到 inference_results.json")
+    # 测试直接回答模型
+    logger.info("\n测试直接回答模型（MoE + 传统训练，类似DeepSeek-V3）...")
+    direct_inference = ModelInference(model_type="direct")
+    for prompt in test_cases:
+        response = direct_inference.generate(prompt)
+        print(f"\n问题: {prompt}")
+        print(f"直接回答模型回答: {response}")
 
 if __name__ == "__main__":
     main() 

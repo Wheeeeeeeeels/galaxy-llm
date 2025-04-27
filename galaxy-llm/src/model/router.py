@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict
 import numpy as np
+from .config import MoEConfig
 
 class GPRORouter(nn.Module):
     def __init__(
@@ -208,4 +209,37 @@ class DynamicRouter(GPRORouter):
         return top_k_probs, top_k_indices, load_balance_loss, extra_info
         
     def reset(self):
-        self.load_balancer.reset() 
+        self.load_balancer.reset()
+
+class Router(nn.Module):
+    """专家路由"""
+    def __init__(self, config: MoEConfig):
+        super().__init__()
+        self.config = config
+        
+        # 路由网络
+        self.router_net = nn.Sequential(
+            nn.Linear(config.expert_config.hidden_size, config.expert_config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.expert_config.hidden_size, config.num_experts)
+        )
+        
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """计算专家权重"""
+        # 计算路由logits
+        logits = self.router_net(hidden_states)
+        
+        # 根据路由类型选择权重计算方式
+        if self.config.routing_type == "learned":
+            weights = F.softmax(logits, dim=-1)
+        elif self.config.routing_type == "random":
+            weights = torch.rand_like(logits)
+            weights = F.softmax(weights, dim=-1)
+        else:  # uniform
+            weights = torch.ones_like(logits) / self.config.num_experts
+            
+        # 选择top_k专家
+        top_k_weights, top_k_indices = torch.topk(weights, self.config.top_k, dim=-1)
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        
+        return top_k_weights, top_k_indices 

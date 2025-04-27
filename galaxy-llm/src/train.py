@@ -9,6 +9,7 @@ from model.config import ModelConfig, COT_MODEL_CONFIG, DIRECT_MODEL_CONFIG
 from model.grpo import GRPO
 from model.reward import RewardModel
 from model.tokenizer import ChineseTokenizer
+from transformers import PreTrainedTokenizerFast
 
 # 配置日志
 logging.basicConfig(
@@ -59,7 +60,7 @@ ds_config = {
 
 class SchoolDataset(Dataset):
     """学校数据集"""
-    def __init__(self, data_path: str, tokenizer: ChineseTokenizer):
+    def __init__(self, data_path: str, tokenizer: PreTrainedTokenizerFast):
         self.tokenizer = tokenizer
         
         # 加载数据
@@ -77,13 +78,26 @@ class SchoolDataset(Dataset):
         output_text = item['output']
         
         # 编码输入和输出
-        input_encoded = self.tokenizer.encode(input_text)
-        output_encoded = self.tokenizer.encode(output_text)
+        input_encoded = self.tokenizer(
+            input_text,
+            max_length=2048,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        output_encoded = self.tokenizer(
+            output_text,
+            max_length=2048,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
         
         return {
-            'input_ids': input_encoded['input_ids'],
-            'attention_mask': input_encoded['attention_mask'],
-            'labels': output_encoded['input_ids'],
+            'input_ids': input_encoded['input_ids'].squeeze(0),
+            'attention_mask': input_encoded['attention_mask'].squeeze(0),
+            'labels': output_encoded['input_ids'].squeeze(0),
             'input_text': input_text,
             'output_text': output_text
         }
@@ -196,15 +210,20 @@ def main():
     logger.info(f"Using device: {device}")
     
     # 初始化分词器
-    tokenizer = ChineseTokenizer()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file="tokenizer/tokenizer.json",
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        cls_token="[CLS]",
+        sep_token="[SEP]",
+        mask_token="[MASK]"
+    )
     
     # 加载训练数据
     with open("data/training/train.json", 'r', encoding='utf-8') as f:
         train_data = json.load(f)
-    
-    # 构建词表
-    texts = [item['instruction'] + item['input'] + item['output'] for item in train_data]
-    tokenizer.build_vocab(texts)
     
     # 创建数据集
     train_dataset = SchoolDataset("data/training/train.json", tokenizer)

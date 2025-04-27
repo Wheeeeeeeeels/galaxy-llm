@@ -30,6 +30,9 @@ class TransformerExpert(nn.Module):
         # 输出层
         self.output_layer = nn.Linear(config.hidden_size, config.vocab_size)
         
+        # 是否使用梯度检查点
+        self.gradient_checkpointing = config.gradient_checkpointing
+        
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -44,8 +47,35 @@ class TransformerExpert(nn.Module):
         # 词嵌入和位置编码
         x = self.embedding(input_ids) + self.position_embedding(position_ids)
         
-        # Transformer编码
-        x = self.transformer(x, src_key_padding_mask=~attention_mask.bool())
+        # 调整注意力掩码的形状
+        src_key_padding_mask = ~attention_mask.bool()  # [batch_size, seq_len]
+        
+        # 创建注意力掩码
+        attn_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=input_ids.device) * float('-inf'),
+            diagonal=1
+        )
+        
+        # Transformer编码（使用梯度检查点）
+        if self.gradient_checkpointing and self.training:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(inputs[0], src_key_padding_mask=inputs[1], mask=inputs[2])
+                return custom_forward
+            
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.transformer),
+                x,
+                src_key_padding_mask,
+                attn_mask,
+                use_reentrant=False
+            )
+        else:
+            x = self.transformer(
+                x,
+                src_key_padding_mask=src_key_padding_mask,
+                mask=attn_mask
+            )
         
         # 输出层
         logits = self.output_layer(x)
@@ -60,9 +90,9 @@ class Router(nn.Module):
         
         # 路由网络
         self.router_net = nn.Sequential(
-            nn.Linear(config.expert_config.hidden_size, 512),
+            nn.Linear(config.expert_config.hidden_size, config.expert_config.hidden_size),
             nn.ReLU(),
-            nn.Linear(512, config.num_experts)
+            nn.Linear(config.expert_config.hidden_size, config.num_experts)
         )
         
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -116,7 +146,10 @@ class MoEModel(nn.Module):
         expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_len, vocab_size]
         
         # 计算专家权重
-        hidden_states = expert_outputs.mean(dim=2)  # [batch_size, num_experts, hidden_size]
+        # 使用最后一个隐藏层的输出作为路由输入
+        hidden_states = expert_outputs[:, :, -1, :]  # [batch_size, num_experts, hidden_size]
+        hidden_states = hidden_states.mean(dim=1)  # [batch_size, hidden_size]
+        hidden_states = hidden_states[:, :self.config.moe_config.expert_config.hidden_size]  # [batch_size, hidden_size]
         weights, indices = self.router(hidden_states)
         
         # 加权组合专家输出
@@ -156,16 +189,27 @@ class MoEModel(nn.Module):
                 sparse_loss += torch.norm(param, p=1)
         sparse_loss = self.config.moe_config.sparsity_weight * sparse_loss
         
-        # 计算多样性损失
+        # 计算多样性损失（优化版本）
         diversity_loss = 0
-        for i in range(len(self.experts)):
-            for j in range(i + 1, len(self.experts)):
-                # 计算专家权重矩阵的余弦相似度
-                w1 = self.experts[i].output_layer.weight
-                w2 = self.experts[j].output_layer.weight
-                similarity = F.cosine_similarity(w1, w2, dim=0)
-                diversity_loss += torch.mean(similarity)
-        diversity_loss = self.config.moe_config.diversity_weight * diversity_loss
+        if self.config.moe_config.diversity_weight > 0:
+            expert_weights = []
+            for expert in self.experts:
+                # 使用较小的子集计算相似度
+                w = expert.output_layer.weight[:1000]  # 只使用前1000个词的权重
+                w = F.normalize(w, p=2, dim=1)  # 归一化
+                expert_weights.append(w)
+            
+            expert_weights = torch.stack(expert_weights)  # [num_experts, 1000, hidden_size]
+            similarity_matrix = torch.matmul(expert_weights, expert_weights.transpose(1, 2))  # [num_experts, 1000, 1000]
+            similarity_matrix = torch.mean(similarity_matrix, dim=(1, 2))  # [num_experts]
+            
+            # 只计算上三角矩阵的相似度
+            num_experts = len(self.experts)
+            for i in range(num_experts):
+                for j in range(i + 1, num_experts):
+                    diversity_loss += similarity_matrix[i] * similarity_matrix[j]
+            
+            diversity_loss = self.config.moe_config.diversity_weight * diversity_loss / (num_experts * (num_experts - 1) / 2)
         
         # 总损失
         total_loss = ce_loss + reg_loss + sparse_loss + diversity_loss
@@ -203,10 +247,10 @@ class MoEModel(nn.Module):
             
             # 采样下一个token
             probs = F.softmax(next_token_logits, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1)
+            next_tokens = torch.multinomial(probs, num_samples=num_return_sequences)
             
             # 更新生成序列
-            generated = torch.cat([generated, next_tokens], dim=1)
+            generated = torch.cat([generated, next_tokens[:, :1]], dim=1)
             generated_attention_mask = torch.cat([
                 generated_attention_mask,
                 torch.ones((batch_size, 1), dtype=torch.bool, device=device)

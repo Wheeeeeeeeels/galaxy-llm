@@ -6,7 +6,7 @@ import re
 import os
 import random
 from tqdm import tqdm
-from online_llm import online_llm_streaming
+from .online_llm import online_llm_streaming
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
